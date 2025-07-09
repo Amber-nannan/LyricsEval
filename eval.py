@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-
+from dataloader import LyricsDataset
+from torch.utils.data import Dataset, DataLoader
 
 PUNCS = set([",", ".", "?", "!", ":", "，", "。", "？", "！", "："])
 
@@ -60,15 +61,17 @@ class LyricsEvaluator:
                 yunjiao2id[final] = group_id
         return yunjiao2id
     
-    def calculate_ppl(self, text: str, stride: int = 512) -> float:
+    def calculate_ppl(self, texts: List[str], stride: int = 512) -> float:
         """计算困惑度 """
         if not self.model or not self.tokenizer:
             print("警告: 模型未加载，无法计算PPL")
-            return -1.0
+            return [-1.0] * len(texts)
         
         try:
-            encodings = self.tokenizer(text, return_tensors="pt")
-            
+            encodings = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+            input_ids = encodings.input_ids.to(self.device)
+            attention_mask = encodings.attention_mask.to(self.device)
+
             if hasattr(self.model.config, 'n_positions'):
                 max_length = self.model.config.n_positions
             elif hasattr(self.model.config, 'max_position_embeddings'):
@@ -76,18 +79,32 @@ class LyricsEvaluator:
             else:
                 max_length = 1024  # 默认值
             
-            seq_len = encodings.input_ids.size(1)
+            seq_len = input_ids.size(1)
             
             # 如果序列长度小于等于最大长度，直接计算
             if seq_len <= max_length:
-                input_ids = encodings.input_ids.to(self.device)
                 with torch.no_grad():
-                    outputs = self.model(input_ids, labels=input_ids)
-                    loss = outputs.loss
-                    ppl = torch.exp(loss).item()
-                return ppl
+                    outputs = self.model(input_ids, labels=input_ids, attention_mask=attention_mask)
+                    # loss = outputs.loss    # 这是整个批次的平均交叉熵损失，但我们要计算每个样本的交叉熵损失，所以需要修改
+
+                    # 第i个样本的困惑度 ppl_i = exp(mean(cross_entropy_loss_i))
+                    logits = outputs.logits
+                    criterion = torch.nn.CrossEntropyLoss(reduction='none')  # 不进行平均，保留每个token的损失
+                    ppls = []
+                    for i in range(input_ids.size(0)):
+                        input_id = input_ids[i]
+                        target = input_id 
+                        logits_i = logits[i, :-1]  # 去掉最后一个token的预测，因为没有标签
+                        target_i = target[1:]  # 去掉第一个token的标签，因为没有预测
+
+                        # 计算当前样本的交叉熵损失
+                        loss_i = criterion(logits_i, target_i)
+                        loss_i = loss_i * attention_mask[i, 1:].float()  # 过滤掉填充部分
+                        ppl = loss_i.sum().item() / attention_mask[i, 1:].sum().item()
+                        ppls.append(ppl)
+                return ppls
             
-            # 对于长序列，使用滑动窗口方法（歌词基本不会超过最大长度）
+            # 对于长序列，使用滑动窗口方法（qwen3的max_length = 40960, 歌词基本100%不会超过，因此下面主要是为了以防万一）
             nll_sum = 0.0
             n_tokens = 0
             prev_end_loc = 0
@@ -147,7 +164,7 @@ class LyricsEvaluator:
         return unique_ngrams / total_ngrams
     
     def calculate_completeness(self, text: str) -> float:
-        """计算完整性，用每句最后一个token的PPL来计算"""
+        """计算完整性，用每句最后一个token为结束符号的概率来计算"""
         
         if not self.model or not self.tokenizer:
             print("警告: 模型未加载，无法计算完整性")
@@ -296,42 +313,47 @@ class LyricsEvaluator:
             results['trigger_word_effect'] = self.calculate_trigger_word_effect(text, original_text, trigger_words)
 
         return results
-    
-    def print_evaluation_report(self, results: Dict[str, float]):
-        """打印评估报告"""
-        print("=" * 50)
-        print("歌词评估报告")
-        print("=" * 50)
-        for metric, score in results.items():
-            print(f"{metric}: {score:.3f}")
-        
-        print("=" * 50)
 
 
-# 使用示例
 if __name__ == "__main__":
-    evaluator = LyricsEvaluator(model_path="/data/project/model_weights/lyrics_gen/Qwen3-0.6B")
+    import json
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Evaluate lyrics generation model.')
+    parser.add_argument('--model_path', type=str, default='/data/project/model_weights/lyrics_gen/Qwen3-0.6B', help='Path to the model weights')
+    parser.add_argument('--data_path', type=str, default='./data/AI/ai_lyrics.json', help='Path to data file')
+    parser.add_argument('--output_path', type=str, default='./results/results.json', help='Path to output file')
+    args = parser.parse_args()
 
-    sample_lyrics = """
-    电视机响床头灯会亮
-    手提包装心里还在想
-    打开车窗看天又快亮
-    房间空荡一人躺椅上
-    没有光线很晃
-    只是灯光太像
-    关门后的小伤
-    等待下班铃响
-    """
+    # 读取数据
+    with open(args.data_path, 'r') as f:
+        data = json.load(f)
+    
+    lyrics = []
+    for item in data:
+        lyrics.append('\n'.join(item['lyrics']))
+    
+    # 创建数据集和数据加载器、评估器
+    dataset = LyricsDataset(lyrics)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+    evaluator = LyricsEvaluator(args.model_path)
 
-    sample_lyrics = sample_lyrics.strip().replace("    ", "")
-
-    results = evaluator.evaluate_lyrics(
-        text=sample_lyrics,
-        target_length=[9,9,9,9,6,6,6,6],
-        trigger_words=["夜晚", "等待", "下班"]
-    )
-
-    evaluator.print_evaluation_report(results)
+    # 评估
+    results = []
+    for batch in dataloader:
+        lyrics = batch['lyrics']
+        target_length = batch['target_length']
+        trigger_words = batch['trigger_words']
+        
+        results = evaluator.evaluate_lyrics(
+            text=lyrics,
+            target_length=target_length,
+            trigger_words=trigger_words
+        )
+    
+    # 保存结果
+    with open(args.ouput_path, 'w') as f:
+        json.dump(results, f, ensure_ascii=False, indent=4)
 
 
 
