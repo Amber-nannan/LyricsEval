@@ -1,8 +1,9 @@
 import os
 import numpy as np
+from tqdm import tqdm
 from pypinyin import Style, lazy_pinyin
 import jieba
-from collections import Counter
+from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,8 @@ from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from dataloader import LyricsDataset
 from torch.utils.data import Dataset, DataLoader
 
-PUNCS = set([",", ".", "?", "!", ":", "，", "。", "？", "！", "："])
+
+PUNCS = set(["《", "》", ",", ".", "?", "!", ":", "，", "。", "？", "！", "："])
 
 yunjiaos = {
             "0":["a", "ia", "ua", "va", "üa"],
@@ -61,89 +63,47 @@ class LyricsEvaluator:
                 yunjiao2id[final] = group_id
         return yunjiao2id
     
-    def calculate_ppl(self, texts: List[str], stride: int = 512) -> float:
-        """计算困惑度 """
+    def calculate_ppl(self, texts: List[str], stride: int = 512) -> List[float]:
+        """批量计算困惑度 """
         if not self.model or not self.tokenizer:
             print("警告: 模型未加载，无法计算PPL")
             return [-1.0] * len(texts)
         
         try:
-            encodings = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-            input_ids = encodings.input_ids.to(self.device)
-            attention_mask = encodings.attention_mask.to(self.device)
-
             if hasattr(self.model.config, 'n_positions'):
                 max_length = self.model.config.n_positions
             elif hasattr(self.model.config, 'max_position_embeddings'):
-                max_length = self.model.config.max_position_embeddings
+                max_length = self.model.config.max_position_embeddings   # qwen3 max_length= 40960
             else:
                 max_length = 1024  # 默认值
             
-            seq_len = input_ids.size(1)
-            
-            # 如果序列长度小于等于最大长度，直接计算
-            if seq_len <= max_length:
-                with torch.no_grad():
-                    outputs = self.model(input_ids, labels=input_ids, attention_mask=attention_mask)
-                    # loss = outputs.loss    # 这是整个批次的平均交叉熵损失，但我们要计算每个样本的交叉熵损失，所以需要修改
+            encodings = self.tokenizer(texts, padding=True, truncation=True, max_length = max_length, return_tensors="pt")
+            input_ids = encodings.input_ids.to(self.device)
+            attention_mask = encodings.attention_mask.to(self.device)
 
-                    # 第i个样本的困惑度 ppl_i = exp(mean(cross_entropy_loss_i))
-                    logits = outputs.logits
-                    criterion = torch.nn.CrossEntropyLoss(reduction='none')  # 不进行平均，保留每个token的损失
-                    ppls = []
-                    for i in range(input_ids.size(0)):
-                        input_id = input_ids[i]
-                        target = input_id 
-                        logits_i = logits[i, :-1]  # 去掉最后一个token的预测，因为没有标签
-                        target_i = target[1:]  # 去掉第一个token的标签，因为没有预测
+            with torch.no_grad():
+                outputs = self.model(input_ids, labels=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
 
-                        # 计算当前样本的交叉熵损失
-                        loss_i = criterion(logits_i, target_i)
-                        loss_i = loss_i * attention_mask[i, 1:].float()  # 过滤掉填充部分
-                        ppl = loss_i.sum().item() / attention_mask[i, 1:].sum().item()
-                        ppls.append(ppl)
-                return ppls
-            
-            # 对于长序列，使用滑动窗口方法（qwen3的max_length = 40960, 歌词基本100%不会超过，因此下面主要是为了以防万一）
-            nll_sum = 0.0
-            n_tokens = 0
-            prev_end_loc = 0
-            
-            for begin_loc in range(0, seq_len, stride):
-                end_loc = min(begin_loc + max_length, seq_len)
-                trg_len = end_loc - prev_end_loc
-                input_ids = encodings.input_ids[:, begin_loc:end_loc].to(self.device)
-                target_ids = input_ids.clone()
-                target_ids[:, :-trg_len] = -100
-                
-                with torch.no_grad():
-                    outputs = self.model(input_ids, labels=target_ids)
-                    neg_log_likelihood = outputs.loss
-                
-                # 累积总的负对数似然和总的token数
-                num_valid_tokens = (target_ids != -100).sum().item()  # target_ids中有效token的数量
-                batch_size = target_ids.size(0)
-                num_loss_tokens = num_valid_tokens - batch_size  # 由于内部标签移位，减去batch_size
-                
-                if num_loss_tokens > 0:
-                    nll_sum += neg_log_likelihood * num_loss_tokens
-                    n_tokens += num_loss_tokens
-                
-                prev_end_loc = end_loc
-                if end_loc == seq_len:
-                    break
-            
-            if n_tokens == 0:
-                return -1.0
-            
-            avg_nll = nll_sum / n_tokens
-            ppl = torch.exp(avg_nll).item()
-            
-            return ppl
-            
+                criterion = torch.nn.CrossEntropyLoss(reduction='none')  # 不进行平均，保留每个token的损失
+                ppls = []
+                # 第i个样本的困惑度 ppl_i = exp(mean(cross_entropy_loss_i))
+                for i in range(input_ids.size(0)):
+                    input_id = input_ids[i]
+                    target = input_id 
+                    logits_i = logits[i, :-1]  # 去掉最后一个token的预测，因为没有标签
+                    target_i = target[1:]  # 去掉第一个token的标签，因为没有预测
+
+                    # 计算当前样本的交叉熵损失、ppl
+                    loss_i = criterion(logits_i, target_i)
+                    loss_i = loss_i * attention_mask[i, 1:].float()  # 过滤掉填充部分
+                    ppl = loss_i.sum().item() / attention_mask[i, 1:].sum().item()
+                    ppls.append(ppl)
+            return ppls
+
         except Exception as e:
             print(f"PPL计算错误: {e}")
-            return -1.0
+            return [-1.0] * len(texts)
     
     def calculate_distinct_n(self, text: str, n: int) -> float:
         """计算distinct-n分数"""
@@ -296,22 +256,28 @@ class LyricsEvaluator:
             print(f"BLEU计算错误: {e}")
             return 0.0
     
-    def evaluate_lyrics(self, text: str, target_length: Optional[List[int]] = None, 
-                        trigger_words: Optional[List[str]] = None,
-                       original_text: Optional[str] = None) -> Dict[str, float]:
+    def evaluate_lyrics(self, texts: List[str],
+                        target_lengths: Optional[List[List[int]]] = None, 
+                        trigger_wordss: Optional[List[List[str]]] = None,
+                       original_texts: Optional[List[str]] = None
+                       ) -> Dict[str, List[float]]:
         """评估歌词"""
-        results = {}
-        results['ppl'] = self.calculate_ppl(text)
-        results['distinct_1'] = self.calculate_distinct_n(text, 1)
-        results['distinct_2'] = self.calculate_distinct_n(text, 2)
-        results['completeness'] = self.calculate_completeness(text)
-        results['rhyme_accuracy'] = self.calculate_rhyme_accuracy(text)
-        if target_length:
-            results['sentence_length_accuracy'] = self.calculate_sentence_length_accuracy(text, target_length)
-        
-        if trigger_words or original_text:
-            results['trigger_word_effect'] = self.calculate_trigger_word_effect(text, original_text, trigger_words)
+        results = defaultdict(list)
+        results['ppl'] = self.calculate_ppl(texts)
 
+        for i, text in enumerate(texts):
+            results['distinct_1'].append(self.calculate_distinct_n(text, 1))
+            results['distinct_2'].append(self.calculate_distinct_n(text, 2))
+            # results['completeness'].append(self.calculate_completeness(text))
+            results['rhyme_accuracy'].append(self.calculate_rhyme_accuracy(text))
+
+            if target_lengths and target_lengths[i]:
+                results['sentence_length_accuracy'].append(self.calculate_sentence_length_accuracy(text, target_lengths[i]))
+            
+            if original_texts and original_texts[i]:
+                results['trigger_word_effect'].append(self.calculate_trigger_word_effect(text, original_text = original_texts[i]))
+            elif trigger_wordss and trigger_wordss[i]:
+                results['trigger_word_effect'].append(self.calculate_trigger_word_effect(text, tringger_words = trigger_wordss[i]))
         return results
 
 
@@ -323,36 +289,44 @@ if __name__ == "__main__":
     parser.add_argument('--model_path', type=str, default='/data/project/model_weights/lyrics_gen/Qwen3-0.6B', help='Path to the model weights')
     parser.add_argument('--data_path', type=str, default='./data/AI/ai_lyrics.json', help='Path to data file')
     parser.add_argument('--output_path', type=str, default='./results/results.json', help='Path to output file')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for evaluation')
     args = parser.parse_args()
 
     # 读取数据
     with open(args.data_path, 'r') as f:
         data = json.load(f)
     
+    # 简单的预处理
+    import re
     lyrics = []
     for item in data:
+        item['lyrics'] = [line.strip() for line in item['lyrics'] if len(line) > 1]
+        item['lyrics'] = [line for line in item['lyrics'] if not re.findall('(《|》|主歌|副歌|间奏|尾奏|桥段|独奏)',line)]
         lyrics.append('\n'.join(item['lyrics']))
     
     # 创建数据集和数据加载器、评估器
     dataset = LyricsDataset(lyrics)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
     evaluator = LyricsEvaluator(args.model_path)
 
     # 评估
-    results = []
-    for batch in dataloader:
+    results = defaultdict(list)
+    for batch in tqdm(dataloader, desc="Evaluating Lyrics", unit="batch"):
         lyrics = batch['lyrics']
-        target_length = batch['target_length']
-        trigger_words = batch['trigger_words']
+        target_length = batch['target_length'] if 'target_length' in batch else None
+        trigger_words = batch['trigger_words'] if 'trigger_words' in batch else None
         
-        results = evaluator.evaluate_lyrics(
-            text=lyrics,
-            target_length=target_length,
-            trigger_words=trigger_words
+        batch_res = evaluator.evaluate_lyrics(
+            texts=lyrics,
+            target_lengths=target_length,
+            trigger_wordss=trigger_words
         )
+
+        for key, values in batch_res.items():
+            results[key].extend(values)
     
     # 保存结果
-    with open(args.ouput_path, 'w') as f:
+    with open(args.output_path, 'w') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
 
 
