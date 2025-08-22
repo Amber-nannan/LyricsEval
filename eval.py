@@ -16,20 +16,25 @@ from torch.utils.data import Dataset, DataLoader
 PUNCS = set(["《", "》", ",", ".", "?", "!", ":", "，", "。", "？", "！", "："])
 
 yunjiaos = {
-            "0":["a", "ia", "ua", "va", "üa"],
-            "1":["e", "o", "uo", "ie", "ue", "üe", "ve"],
-            "2":["u"],
-            "3":["i", "ü", "v"],
-            "4":["ai", "uai"],
-            "5":["ao", "iao"],
-            "6":["ou", "iu", "iou"],
-            "7":["an", "ian", "uan", "üan", "van"],
-            "8":["en", "in", "un", "ün", "vn"],
-            "9":["ang", "iang", "uang"],
-            "10":["eng", "ing", "ueng", "ong", "iong"],
-            "11":["er"],
-            "12":["ei", "ui", "uei", "vei"],
-           }
+    "0": ["e"],
+    "1": ["ie", "ue", "ve"],
+    "2": ["a", "ia", "ua"],
+    "3": ["o", "uo"],
+    "4": ["i"],
+    "5": ["v"],
+    "6": ["ei", "uei", "ui"],
+    "7": ["ai", "uai"],
+    "8": ["u"],
+    "9": ["ou", "iu", "iou"],
+    "10": ["ao", "iao"],
+    "11": ["an", "uan"],
+    "12": ["ian", "van"],
+    "13": ["ang", "iang", "uang"],
+    "14": ["in", "ing"],
+    "15": ["en", "un", "uen"],
+    "16": ["eng"],
+    "17": ["iong", "ong"]
+}
 
 
 class LyricsEvaluator:
@@ -221,6 +226,17 @@ class LyricsEvaluator:
             print(f"计算押韵准确度时出错: {e}")
             return 0.0
 
+    def calculate_rhyme_count(self, text: str) -> float:
+        """计算歌词的韵脚数量"""
+        try:
+            lyrics = text.split("\n")
+            rhyme_group = self.get_rhyme_group(lyrics)
+            return len(set(rhyme_group)-{"unknown"})
+
+        except Exception as e:
+            print(f"计算押韵数量时出错: {e}")
+            return 0.0
+        
     def calculate_sentence_length_accuracy(self, text: str, target_length: List[int], tolerance: int = 0) -> float:
         """计算句子长度准确率"""
         lyrics = text.split('\n')
@@ -269,7 +285,8 @@ class LyricsEvaluator:
             results['distinct_1'].append(self.calculate_distinct_n(text, 1))
             results['distinct_2'].append(self.calculate_distinct_n(text, 2))
             # results['completeness'].append(self.calculate_completeness(text))
-            results['rhyme_accuracy'].append(self.calculate_rhyme_accuracy(text))
+            # results['rhyme_accuracy'].append(self.calculate_rhyme_accuracy(text))
+            results['rhyme_count'].append(self.calculate_rhyme_count(text))
 
             if target_lengths and target_lengths[i]:
                 results['sentence_length_accuracy'].append(self.calculate_sentence_length_accuracy(text, target_lengths[i]))
@@ -328,6 +345,7 @@ if __name__ == "__main__":
     # 保存结果
     with open(args.output_path, 'w') as f:
         json.dump(results, f, ensure_ascii=False, indent=4)
+    print("Eval results saved to", args.output_path)
 
 
 
